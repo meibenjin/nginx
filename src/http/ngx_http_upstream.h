@@ -58,8 +58,9 @@ typedef struct {
     ngx_uint_t                       bl_state;
 
     ngx_uint_t                       status;
-    time_t                           response_sec;
-    ngx_uint_t                       response_msec;
+    ngx_msec_t                       response_time;
+    ngx_msec_t                       connect_time;
+    ngx_msec_t                       header_time;
     off_t                            response_length;
 
     ngx_str_t                       *peer;
@@ -121,6 +122,10 @@ struct ngx_http_upstream_srv_conf_s {
     in_port_t                        port;
     in_port_t                        default_port;
     ngx_uint_t                       no_port;  /* unsigned no_port:1 */
+
+#if (NGX_HTTP_UPSTREAM_ZONE)
+    ngx_shm_zone_t                  *shm_zone;
+#endif
 };
 
 
@@ -158,6 +163,7 @@ typedef struct {
     ngx_uint_t                       store_access;
     ngx_uint_t                       next_upstream_tries;
     ngx_flag_t                       buffering;
+    ngx_flag_t                       request_buffering;
     ngx_flag_t                       pass_request_headers;
     ngx_flag_t                       pass_request_body;
 
@@ -175,7 +181,8 @@ typedef struct {
     ngx_http_upstream_local_t       *local;
 
 #if (NGX_HTTP_CACHE)
-    ngx_shm_zone_t                  *cache;
+    ngx_shm_zone_t                  *cache_zone;
+    ngx_http_complex_value_t        *cache_value;
 
     ngx_uint_t                       cache_min_uses;
     ngx_uint_t                       cache_use_stale;
@@ -183,6 +190,7 @@ typedef struct {
 
     ngx_flag_t                       cache_lock;
     ngx_msec_t                       cache_lock_timeout;
+    ngx_msec_t                       cache_lock_age;
 
     ngx_flag_t                       cache_revalidate;
 
@@ -194,6 +202,9 @@ typedef struct {
     ngx_array_t                     *store_lengths;
     ngx_array_t                     *store_values;
 
+#if (NGX_HTTP_CACHE)
+    signed                           cache:2;
+#endif
     signed                           store:2;
     unsigned                         intercept_404:1;
     unsigned                         change_buffering:1;
@@ -296,6 +307,9 @@ struct ngx_http_upstream_s {
     ngx_chain_writer_ctx_t           writer;
 
     ngx_http_upstream_conf_t        *conf;
+#if (NGX_HTTP_CACHE)
+    ngx_array_t                     *caches;
+#endif
 
     ngx_http_upstream_headers_in_t   headers_in;
 

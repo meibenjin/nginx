@@ -249,6 +249,12 @@ ngx_ssl_create(ngx_ssl_t *ssl, ngx_uint_t protocols, void *data)
 
     SSL_CTX_set_options(ssl->ctx, SSL_OP_SINGLE_DH_USE);
 
+#ifdef SSL_CTRL_CLEAR_OPTIONS
+    /* only in 0.9.8m+ */
+    SSL_CTX_clear_options(ssl->ctx,
+                          SSL_OP_NO_SSLv2|SSL_OP_NO_SSLv3|SSL_OP_NO_TLSv1);
+#endif
+
     if (!(protocols & NGX_SSL_SSLv2)) {
         SSL_CTX_set_options(ssl->ctx, SSL_OP_NO_SSLv2);
     }
@@ -259,11 +265,13 @@ ngx_ssl_create(ngx_ssl_t *ssl, ngx_uint_t protocols, void *data)
         SSL_CTX_set_options(ssl->ctx, SSL_OP_NO_TLSv1);
     }
 #ifdef SSL_OP_NO_TLSv1_1
+    SSL_CTX_clear_options(ssl->ctx, SSL_OP_NO_TLSv1_1);
     if (!(protocols & NGX_SSL_TLSv1_1)) {
         SSL_CTX_set_options(ssl->ctx, SSL_OP_NO_TLSv1_1);
     }
 #endif
 #ifdef SSL_OP_NO_TLSv1_2
+    SSL_CTX_clear_options(ssl->ctx, SSL_OP_NO_TLSv1_2);
     if (!(protocols & NGX_SSL_TLSv1_2)) {
         SSL_CTX_set_options(ssl->ctx, SSL_OP_NO_TLSv1_2);
     }
@@ -275,6 +283,10 @@ ngx_ssl_create(ngx_ssl_t *ssl, ngx_uint_t protocols, void *data)
 
 #ifdef SSL_MODE_RELEASE_BUFFERS
     SSL_CTX_set_mode(ssl->ctx, SSL_MODE_RELEASE_BUFFERS);
+#endif
+
+#ifdef SSL_MODE_NO_AUTO_CHAIN
+    SSL_CTX_set_mode(ssl->ctx, SSL_MODE_NO_AUTO_CHAIN);
 #endif
 
     SSL_CTX_set_read_ahead(ssl->ctx, 1);
@@ -376,6 +388,67 @@ ngx_ssl_certificate(ngx_conf_t *cf, ngx_ssl_t *ssl, ngx_str_t *cert,
 
     BIO_free(bio);
 
+    if (ngx_strncmp(key->data, "engine:", sizeof("engine:") - 1) == 0) {
+
+#ifndef OPENSSL_NO_ENGINE
+
+        u_char      *p, *last;
+        ENGINE      *engine;
+        EVP_PKEY    *pkey;
+
+        p = key->data + sizeof("engine:") - 1;
+        last = (u_char *) ngx_strchr(p, ':');
+
+        if (last == NULL) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "invalid syntax in \"%V\"", key);
+            return NGX_ERROR;
+        }
+
+        *last = '\0';
+
+        engine = ENGINE_by_id((char *) p);
+
+        if (engine == NULL) {
+            ngx_ssl_error(NGX_LOG_EMERG, ssl->log, 0,
+                          "ENGINE_by_id(\"%s\") failed", p);
+            return NGX_ERROR;
+        }
+
+        *last++ = ':';
+
+        pkey = ENGINE_load_private_key(engine, (char *) last, 0, 0);
+
+        if (pkey == NULL) {
+            ngx_ssl_error(NGX_LOG_EMERG, ssl->log, 0,
+                          "ENGINE_load_private_key(\"%s\") failed", last);
+            ENGINE_free(engine);
+            return NGX_ERROR;
+        }
+
+        ENGINE_free(engine);
+
+        if (SSL_CTX_use_PrivateKey(ssl->ctx, pkey) == 0) {
+            ngx_ssl_error(NGX_LOG_EMERG, ssl->log, 0,
+                          "SSL_CTX_use_PrivateKey(\"%s\") failed", last);
+            EVP_PKEY_free(pkey);
+            return NGX_ERROR;
+        }
+
+        EVP_PKEY_free(pkey);
+
+        return NGX_OK;
+
+#else
+
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "loading \"engine:...\" certificate keys "
+                           "is not supported");
+        return NGX_ERROR;
+
+#endif
+    }
+
     if (ngx_conf_full_name(cf->cycle, key, 1) != NGX_OK) {
         return NGX_ERROR;
     }
@@ -404,20 +477,9 @@ ngx_ssl_certificate(ngx_conf_t *cf, ngx_ssl_t *ssl, ngx_str_t *cert,
         }
 
         if (--tries) {
-            n = ERR_peek_error();
-
-#ifdef OPENSSL_IS_BORINGSSL
-            if (ERR_GET_LIB(n) == ERR_LIB_CIPHER
-                && ERR_GET_REASON(n) == CIPHER_R_BAD_DECRYPT)
-#else
-            if (ERR_GET_LIB(n) == ERR_LIB_EVP
-                && ERR_GET_REASON(n) == EVP_R_BAD_DECRYPT)
-#endif
-            {
-                ERR_clear_error();
-                SSL_CTX_set_default_passwd_cb_userdata(ssl->ctx, ++pwd);
-                continue;
-            }
+            ERR_clear_error();
+            SSL_CTX_set_default_passwd_cb_userdata(ssl->ctx, ++pwd);
+            continue;
         }
 
         ngx_ssl_error(NGX_LOG_EMERG, ssl->log, 0,
@@ -1096,10 +1158,14 @@ ngx_ssl_handshake(ngx_connection_t *c)
         c->recv_chain = ngx_ssl_recv_chain;
         c->send_chain = ngx_ssl_send_chain;
 
+#ifdef SSL3_FLAGS_NO_RENEGOTIATE_CIPHERS
+
         /* initial handshake done, disable renegotiation (CVE-2009-3555) */
         if (c->ssl->connection->s3) {
             c->ssl->connection->s3->flags |= SSL3_FLAGS_NO_RENEGOTIATE_CIPHERS;
         }
+
+#endif
 
         return NGX_OK;
     }
@@ -1462,7 +1528,6 @@ ngx_ssl_send_chain(ngx_connection_t *c, ngx_chain_t *in, off_t limit)
             }
 
             in->buf->pos += n;
-            c->sent += n;
 
             if (in->buf->pos == in->buf->last) {
                 in = in->next;
@@ -1563,7 +1628,6 @@ ngx_ssl_send_chain(ngx_connection_t *c, ngx_chain_t *in, off_t limit)
         }
 
         buf->pos += n;
-        c->sent += n;
 
         if (n < size) {
             break;
@@ -1620,6 +1684,8 @@ ngx_ssl_write(ngx_connection_t *c, u_char *data, size_t size)
 
             ngx_post_event(c->read, &ngx_posted_events);
         }
+
+        c->sent += n;
 
         return n;
     }
@@ -1868,6 +1934,9 @@ ngx_ssl_connection_error(ngx_connection_t *c, int sslerr, ngx_err_t err,
 #endif
 #ifdef SSL_R_SCSV_RECEIVED_WHEN_RENEGOTIATING
             || n == SSL_R_SCSV_RECEIVED_WHEN_RENEGOTIATING           /*  345 */
+#endif
+#ifdef SSL_R_INAPPROPRIATE_FALLBACK
+            || n == SSL_R_INAPPROPRIATE_FALLBACK                     /*  373 */
 #endif
             || n == 1000 /* SSL_R_SSLV3_ALERT_CLOSE_NOTIFY */
             || n == SSL_R_SSLV3_ALERT_UNEXPECTED_MESSAGE             /* 1010 */
